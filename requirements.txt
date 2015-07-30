@@ -1,0 +1,2 @@
+irc>=12
+docopt
