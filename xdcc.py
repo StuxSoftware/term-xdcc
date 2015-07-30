@@ -24,12 +24,28 @@ import time
 import math
 import struct
 import select
+import shutil
 import getpass
 from shlex import split
 from subprocess import list2cmdline
 from threading import Thread
 import docopt
 import irc.client
+
+
+suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+def humansize(nbytes):
+    if nbytes == 0:
+        return '0 B'
+
+    # Very unpythonic but as long as it works.
+    i = 0
+    while nbytes >= 1024 and i < len(suffixes)-1:
+        nbytes /= 1024.
+        i += 1
+
+    f = ('%.2f' % nbytes).rstrip(".00")
+    return '%s%s' % (f, suffixes[i])
 
 
 class OptionContainer(object):
@@ -69,6 +85,8 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.dcc = None
         self._exited = False
         self.received_bytes = 0
+
+        self._bar_received_bytes = 0
         self._timeout_received_bytes = 0
 
         self.original_filename = ""
@@ -194,12 +212,32 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             else:
                 extra = repr(self.original_filename)
 
+            # Make sure the status line fits the screen.
+            term_size = shutil.get_terminal_size((80,20))
+            self._last_str = self._last_str[:term_size.columns]
+
+            # Clear the status line.
             self._termmsg("\r" + (" "*len(self._last_str)), end="")
 
-            self._last_str = "".join(("\r%.2f/%.2f"%(
-                self.received_bytes/1024/1024,
-                self.size/1024/1024
-            ), " [", posstr,  "] ", extra, " "))
+            if term_size.columns > 100:
+                # Calcculate speed meter.
+                speed = " ---.--    "
+                if self.received_bytes != 0:
+                    byte_delta = self.received_bytes - self._bar_received_bytes
+                    speed = " %8s/s"%humansize(byte_delta)
+                    self._bar_received_bytes = self.received_bytes
+            else:
+                speed = ""
+
+            # Generate the new one.
+            self._last_str = "".join(("\r%8s/%8s"%(
+                humansize(self.received_bytes),
+                humansize(self.size)
+            ),  speed, " [", posstr,  "] ", extra, " "))
+
+            # Concatenate the terminal size.
+            if term_size.columns < len(self._last_str):
+                self._last_str = self._last_str[:term_size.columns-3]+"..."
 
             self._termmsg(self._last_str, end="")
             time.sleep(1)
