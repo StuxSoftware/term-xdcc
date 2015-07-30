@@ -13,6 +13,8 @@ Options:
   --id ID, -i ID
   --sender S            Who can send the dcc request. [Default: target]
                         Choices: [target, <name>, all]
+  --channel C, -c C     The channel the bot should join before requesting
+                        the pack.
 """
 import struct
 import select
@@ -25,7 +27,7 @@ import irc.client
 
 
 class OptionContainer(object):
-    __slots__ = ("sender", )
+    __slots__ = ("sender", "channel")
     def __init__(self, *args, **kwargs):
         kwargs.update(dict(zip(self.__slots__, args)))
         for k,v in kwargs.items():
@@ -70,6 +72,15 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
     def on_welcome(self, conn, evt):
         self._termmsg("Waiting for connection.")
+        if self.options.channel is None:
+            self._initiate()
+        else:
+            self.connection.join(self.options.channel)
+
+    def on_join(self, conn, evt):
+        self._initiate()
+
+    def _initiate(self):
         self.connection.privmsg(self.target, self.cmd)
     def _termmsg(self, *args, **kwargs):
         import sys
@@ -183,7 +194,8 @@ def main():
         nick = getpass.getuser()
 
     options = OptionContainer(
-        sender = args["--sender"]
+        sender = args["--sender"],
+        channel = args["--channel"]
     )
 
     cl = XDCCDownloadClient(
@@ -192,7 +204,6 @@ def main():
         args["<file>"],
         options
     )
-    cl._termmsg(repr(options))
     cl.connect(target, port, nick)
     cl.start()
 
