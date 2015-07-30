@@ -60,6 +60,10 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self._exited = False
         self.received_bytes = 0
 
+    def on_nicknameinuse(self, conn, evt):
+        self._termmsg("Nickname already in use.")
+        conn.nick(conn.get_nickname() + "_")
+
     def on_ctcp(self, conn, evt):
         cmd, *args = evt.arguments
         if cmd == "VERSION":
@@ -86,21 +90,26 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         import sys
         print(*args, file=sys.stderr, **kwargs)
 
-    def do_dcc(self, conn, evt):
+    def check_source(self, source, target=False):
+        if target:
+            if source.nick == self.target:
+                return True
+
         # Ensure we have the correct sender.
         if self.options.sender != "all":
-            nick = evt.source.nick
+            nick = source.nick
             for name in self.options.sender.split(","):
                 if name == "target":
                     if nick == self.target:
-                        break
+                        return True
                 elif name == nick:
-                    break
-            else:
-                self._termmsg("Detected request from unknown source: %s" % (
-                    nick
-                ))
-                return
+                    return True
+            return False
+        return True
+    def do_dcc(self, conn, evt):
+        if not self.check_source(evt.source):
+            self._termmsg("Unknown DCC Source: " + str(evt))
+            return
 
         payload = evt.arguments[1]
         cmd, fn, addr, port, sz = split(payload)
@@ -173,7 +182,10 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self._termmsg("Downloading into:", orig)
             return open(orig, "wb")
 
-
+    def on_privmsg(self, conn, evt):
+        if self.check_source(evt.source, target=True):
+            self._termmsg(">", *evt.arguments)
+    on_privnotice = on_privmsg
 def main():
     args = docopt.docopt(__doc__)
 
