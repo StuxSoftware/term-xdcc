@@ -11,6 +11,8 @@ Options:
   --id-prefix I         The prefix for the ID. [Default: #]
   --bot BOT, -b BOT
   --id ID, -i ID
+  --sender S            Who can send the dcc request. [Default: target]
+                        Choices: [target, <name>, all]
 """
 import struct
 import select
@@ -21,12 +23,37 @@ from threading import Thread
 import docopt
 import irc.client
 
+
+class OptionContainer(object):
+    __slots__ = ("sender", )
+    def __init__(self, *args, **kwargs):
+        kwargs.update(dict(zip(self.__slots__, args)))
+        for k,v in kwargs.items():
+            setattr(self, k, v)
+
+    def __repr__(self):
+        string = [
+            "<",
+            self.__class__.__name__,
+        ]
+        for k in self.__slots__:
+            string.append(" ")
+            string.append(k)
+            string.append("=")
+            string.append(repr(getattr(self, k)))
+
+        string.append(">")
+        return "".join(string)
+
+
 class XDCCDownloadClient(irc.client.SimpleIRCClient):
-    def __init__(self, target, cmd, file):
+    def __init__(self, target, cmd, file, options):
         super(XDCCDownloadClient, self).__init__()
         self.target = target
         self.cmd = cmd
         self.file = file
+
+        self.options = options
 
         self._exited = False
         self.received_bytes = 0
@@ -49,6 +76,21 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         print(*args, file=sys.stderr, **kwargs)
 
     def do_dcc(self, conn, evt):
+        # Ensure we have the correct sender.
+        if options.sender != "all":
+            nick = evt.source.nick
+            for name in options.sender.split(","):
+                if name == "target":
+                    if name == self.target:
+                        break
+                elif name == nick:
+                    break
+            else:
+                self._termmsg("Detected request from unknown source: %s" % (
+                    nick
+                ))
+                return
+
         payload = evt.arguments[1]
         cmd, fn, addr, port, sz = split(payload)
         if cmd != "SEND":
@@ -138,6 +180,10 @@ def main():
     nick = args["<nick>"]
     if nick is None:
         nick = getpass.getuser()
+
+    options = OptionContainer(
+        sender = args["--sender"]
+    )
 
     cl = XDCCDownloadClient(
         args["--bot"],
