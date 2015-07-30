@@ -77,11 +77,11 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
     def do_dcc(self, conn, evt):
         # Ensure we have the correct sender.
-        if options.sender != "all":
+        if self.options.sender != "all":
             nick = evt.source.nick
-            for name in options.sender.split(","):
+            for name in self.options.sender.split(","):
                 if name == "target":
-                    if name == self.target:
+                    if nick == self.target:
                         break
                 elif name == nick:
                     break
@@ -162,6 +162,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self._termmsg("Downloading into:", orig)
             return open(orig, "wb")
 
+
 def main():
     args = docopt.docopt(__doc__)
 
@@ -188,8 +189,10 @@ def main():
     cl = XDCCDownloadClient(
         args["--bot"],
         args["--verb"] + " " + args["--id-prefix"] + args["--id"],
-        args["<file>"]
+        args["<file>"],
+        options
     )
+    cl._termmsg(repr(options))
     cl.connect(target, port, nick)
     cl.start()
 
