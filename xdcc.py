@@ -4,7 +4,7 @@ XDCC Downloader
 
 Usage:
   xdcc.py [-h | --help]
-  xdcc.py <target> <nick> [ <file> | - ] -b BOT -i ID [options]
+  xdcc.py (<target>) [<nick>] [ <file> | - ] -b BOT -i ID [options]
 
 Options:
   --verb V              The command sent to the bot [Default: XDCC SEND]
@@ -14,6 +14,7 @@ Options:
 """
 import struct
 import select
+import getpass
 from shlex import split
 from subprocess import list2cmdline
 from threading import Thread
@@ -27,6 +28,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.cmd = cmd
         self.file = file
 
+        self._exited = False
         self.received_bytes = 0
 
     def on_ctcp(self, conn, evt):
@@ -100,7 +102,9 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.connection.quit()
         self.dcc.disconnect()
         self.dcc = None
-        self._termmsg("\nDownload complete.")
+        if not self._exited:
+            self._termmsg("\nDownload complete.")
+            self._exited = True
 
     def on_disconnect(self, conn, evt):
         import sys
@@ -118,10 +122,14 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
 def main():
     args = docopt.docopt(__doc__)
-    target = args["<target>"].split(":")
-    if len(target)>2:
+
+    target = args.get("<target>", "")
+    if target is not None:
+        target = target.split(":")
+
+    if target is None or len(target)>2:
         print("Invalid target.")
-        return
+        return -1
     elif len(target)==2:
         target, port = target[0], int(target[1])
     else:
@@ -132,8 +140,9 @@ def main():
         args["--verb"] + " " + args["--id-prefix"] + args["--id"],
         args["<file>"]
     )
-    cl.connect(target, port, args["<nick>"])
+    cl.connect(target, port, args.get("<nick>", getpass.getuser()))
     cl.start()
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main())
