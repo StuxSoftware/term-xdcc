@@ -135,12 +135,16 @@ def main():
     else:
         (target,), port = target, 6667
 
+    nick = args["<nick>"]
+    if nick is None:
+        nick = getpass.getuser()
+
     cl = XDCCDownloadClient(
         args["--bot"],
         args["--verb"] + " " + args["--id-prefix"] + args["--id"],
         args["<file>"]
     )
-    cl.connect(target, port, args.get("<nick>", getpass.getuser()))
+    cl.connect(target, port, nick)
     cl.start()
 
 if __name__ == "__main__":
