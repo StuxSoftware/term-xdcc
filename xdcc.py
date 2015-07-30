@@ -15,7 +15,9 @@ Options:
                         Choices: [target, <name>, all]
   --channel C, -c C     The channel the bot should join before requesting
                         the pack.
+  --timeout T, -t T     How long should we wait. (in s) [Default: 30]
 """
+import time
 import struct
 import select
 import getpass
@@ -27,7 +29,7 @@ import irc.client
 
 
 class OptionContainer(object):
-    __slots__ = ("sender", "channel")
+    __slots__ = ("sender", "channel", "timeout")
     def __init__(self, *args, **kwargs):
         kwargs.update(dict(zip(self.__slots__, args)))
         for k,v in kwargs.items():
@@ -57,8 +59,10 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
         self.options = options
 
+        self.dcc = None
         self._exited = False
         self.received_bytes = 0
+        self.original_filename = ""
 
     def on_nicknameinuse(self, conn, evt):
         self._termmsg("Nickname already in use.")
@@ -86,6 +90,16 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
     def _initiate(self):
         self.connection.privmsg(self.target, self.cmd)
+        self._request_time = time.time()
+        t = Thread(target=self._await_timeout)
+        t.setDaemon(True)
+        t.start()
+
+    def _await_timeout(self):
+        time.sleep(self.options.timeout)
+        if self.dcc is None:
+            self.connection.quit()
+
     def _termmsg(self, *args, **kwargs):
         import sys
         print(*args, file=sys.stderr, **kwargs)
@@ -118,6 +132,8 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self.connection.quit()
             return
 
+        self.original_filename = fn
+
         import os.path
         self.stream = self._get_stream_of_file(os.path.basename(fn))
         addr, port = irc.client.ip_numstr_to_quad(addr), int(port)
@@ -127,7 +143,6 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self._thread.start()
 
     def _dlnotice(self):
-        import time
         import math
 
         while self.dcc is not None:
@@ -140,7 +155,8 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self._termmsg("\r%.2f/%.2f"%(
                 self.received_bytes/1024/1024,
                 self.size/1024/1024
-            ), " [", posstr,  "] ", sep=" ", end="")
+            ), " [", posstr,  "] '", self.original_filename, "'",
+                sep="", end="")
             time.sleep(1)
 
     def on_dccmsg(self, conn, evt):
@@ -207,7 +223,8 @@ def main():
 
     options = OptionContainer(
         sender = args["--sender"],
-        channel = args["--channel"]
+        channel = args["--channel"],
+        timeout = int(args["--timeout"])
     )
 
     cl = XDCCDownloadClient(
@@ -217,7 +234,10 @@ def main():
         options
     )
     cl.connect(target, port, nick)
-    cl.start()
+    try:
+        cl.start()
+    except KeyboardInterrupt:
+        cl.on_dcc_disconnect(None, None)
 
 if __name__ == "__main__":
     import sys
