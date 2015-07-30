@@ -4,20 +4,24 @@ XDCC Downloader
 
 Usage:
   xdcc.py [-h | --help]
-  xdcc.py (<target>) [<nick>] [ <file> | - ] -b BOT -i ID [options]
+  xdcc.py (<target> <bot> <id>) [ -f FILE | - ] [-n NICK] [options]
 
 Options:
-  --verb V              The command sent to the bot [Default: XDCC SEND]
-  --id-prefix I         The prefix for the ID. [Default: #]
-  --bot BOT, -b BOT
-  --id ID, -i ID
-  --sender S            Who can send the dcc request. [Default: target]
-                        Choices: [target, <name>, all]
-  --channel C, -c C     The channel the bot should join before requesting
-                        the pack.
-  --timeout T, -t T     How long should we wait. (in s) [Default: 30]
+  --file FILE, -f FILE     The desired filename
+  --nick NICK, -n NICK     The desired nickname
+  --sender S               Who can send the dcc request. [Default: target]
+                           Choices: [target, <name>, all]
+  --channel C, -c C        The channel the bot should join before requesting
+                           the pack.
+  --timeout T, -t T        How long should we wait. (in s) [Default: 30]
+  --verb V                 The command sent to the bot [Default: XDCC SEND]
+  --id-prefix I            The prefix for the ID. [Default: #]
+  --user-agent UA          [Default: XDCC.PY/0.0.1 (PYTHON-IRCLIB/12)]
+  --force-response         Should the bot force the DCC-Response packets to
+                           be sent?
 """
 import time
+import math
 import struct
 import select
 import getpass
@@ -29,7 +33,10 @@ import irc.client
 
 
 class OptionContainer(object):
-    __slots__ = ("sender", "channel", "timeout")
+    __slots__ = (
+        "sender", "channel", "timeout", "user_agent",
+        "force_response"
+    )
     def __init__(self, *args, **kwargs):
         kwargs.update(dict(zip(self.__slots__, args)))
         for k,v in kwargs.items():
@@ -62,7 +69,13 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.dcc = None
         self._exited = False
         self.received_bytes = 0
+        self._timeout_received_bytes = 0
+
         self.original_filename = ""
+
+        self.warning = ""
+        self._short_warning = True
+        self._refresh_timeout = False
 
     def on_nicknameinuse(self, conn, evt):
         self._termmsg("Nickname already in use.")
@@ -71,7 +84,9 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
     def on_ctcp(self, conn, evt):
         cmd, *args = evt.arguments
         if cmd == "VERSION":
-            self.connection.ctcp_reply(evt.source.nick, "VERSION xdcc.py 0.0.1")
+            self.connection.ctcp_reply(
+                evt.source.nick, "VERSION " + self.options.user_agent
+            )
         elif cmd == "DCC":
             self.do_dcc(conn, evt)
         else:
@@ -99,6 +114,27 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         time.sleep(self.options.timeout)
         if self.dcc is None:
             self.connection.quit()
+            return
+
+        while self.dcc is not None:
+            for i in range(max(int(self.options.timeout), 1)):
+                time.sleep(1)
+
+                # We were notified that we should reset the timeout
+                # since we expect a timeout.
+                if self._refresh_timeout:
+                    self._refresh_timeout = False
+                    break
+
+                # Hey, we finished in one way or another. Kill myself.
+                if self.dcc is None:
+                    return
+
+            # Yeah, we failed. Stop the client.
+            if self.received_bytes == self._timeout_received_bytes:
+                self.connection.quit()
+                self._termmsg("\nDownload timed out.")
+                return
 
     def _termmsg(self, *args, **kwargs):
         import sys
@@ -139,24 +175,33 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         addr, port = irc.client.ip_numstr_to_quad(addr), int(port)
         self.dcc = self.dcc_connect(addr, port, "raw")
         self.size = int(sz)
-        self._thread = Thread(target=self._dlnotice)
-        self._thread.start()
+        _thread = Thread(target=self._dlnotice)
+        _thread.setDaemon(True)
+        _thread.start()
 
     def _dlnotice(self):
-        import math
-
+        self._last_str = ""
         while self.dcc is not None:
             pos = self.received_bytes/self.size
             pos = int(30*pos)
 
             posstr = (("="*pos)+">").ljust(30, " ")
 
+            if self.warning:
+                extra = ">> " + self.warning + " <<"
+                if self._short_warning:
+                    self.warning = ""
+            else:
+                extra = repr(self.original_filename)
 
-            self._termmsg("\r%.2f/%.2f"%(
+            self._termmsg("\r" + (" "*len(self._last_str)), end="")
+
+            self._last_str = "".join(("\r%.2f/%.2f"%(
                 self.received_bytes/1024/1024,
                 self.size/1024/1024
-            ), " [", posstr,  "] '", self.original_filename, "'",
-                sep="", end="")
+            ), " [", posstr,  "] ", extra, " "))
+
+            self._termmsg(self._last_str, end="")
             time.sleep(1)
 
     def on_dccmsg(self, conn, evt):
@@ -168,8 +213,22 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         # Make sure we can write to the socket without blocking.
         # Otherwise just silently drop the received_bytes notice.
         r,w,x = select.select([], [self.dcc.socket], [], 0)
-        if self.dcc.socket in w:
+        if self.options.force_response or (self.dcc.socket in w):
+
+            blocks =  self.options.force_response and self.dcc.socket not in w
+
+            # Send a warning message so the users get a warning if it
+            # starts to block.
+            if blocks:
+                self._short_warning = False
+                self._refresh_timeout = True               # Expect timeout
+                self.warning = "Download my be stuck."
+
             self.dcc.send_bytes(struct.pack("!I", self.received_bytes))
+
+            if blocks:
+                self._short_warning = True
+                self.warning = ""
 
         # Some peers do not drop connection after we received the file.
         if self.received_bytes == self.size:
@@ -181,12 +240,15 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.dcc.disconnect()
         self.dcc = None
         if not self._exited:
-            self._termmsg("\nDownload complete.")
+            if self.received_bytes == self.size:
+                self._termmsg("\nDownload complete.")
+            else:
+                self._termmsg()
             self._exited = True
 
     def on_disconnect(self, conn, evt):
         import sys
-        sys.exit(0)
+        sys.exit(0 if self.received_bytes == self.size else 1)
 
     def _get_stream_of_file(self, orig):
         if self.file == "-":
@@ -202,9 +264,10 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         if self.check_source(evt.source, target=True):
             self._termmsg(">", *evt.arguments)
     on_privnotice = on_privmsg
+
+
 def main():
     args = docopt.docopt(__doc__)
-
     target = args.get("<target>", "")
     if target is not None:
         target = target.split(":")
@@ -217,20 +280,25 @@ def main():
     else:
         (target,), port = target, 6667
 
-    nick = args["<nick>"]
+    if args["-"]:
+        args["--file"] = "-"
+
+    nick = args["--nick"]
     if nick is None:
         nick = getpass.getuser()
 
     options = OptionContainer(
         sender = args["--sender"],
         channel = args["--channel"],
-        timeout = int(args["--timeout"])
+        timeout = int(args["--timeout"]),
+        user_agent = args["--user-agent"],
+        force_response = args["--force-response"]
     )
 
     cl = XDCCDownloadClient(
-        args["--bot"],
-        args["--verb"] + " " + args["--id-prefix"] + args["--id"],
-        args["<file>"],
+        args["<bot>"],
+        args["--verb"] + " " + args["--id-prefix"] + args["<id>"],
+        args["--file"],
         options
     )
     cl.connect(target, port, nick)
