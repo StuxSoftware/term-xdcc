@@ -95,7 +95,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
     def on_welcome(self, conn, evt):
         self._termmsg("Waiting for connection.")
-        if self.options.channel is None:
+        if not self.options.channel:
             self._initiate()
         else:
             self.connection.join(self.options.channel)
