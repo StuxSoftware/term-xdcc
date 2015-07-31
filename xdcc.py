@@ -26,10 +26,12 @@ import struct
 import select
 import shutil
 import getpass
+import os.path
+import argparse
 from shlex import split
 from subprocess import list2cmdline
-from threading import Thread
-import docopt
+from threading import Thread, Event
+
 import irc.client
 
 
@@ -48,32 +50,23 @@ def humansize(nbytes):
     return '%s%s' % (f, suffixes[i])
 
 
-class OptionContainer(object):
-    __slots__ = (
-        "sender", "channel", "timeout", "user_agent",
-        "force_response"
-    )
+class XDCCStopableReactor(irc.client.Reactor):
+
     def __init__(self, *args, **kwargs):
-        kwargs.update(dict(zip(self.__slots__, args)))
-        for k,v in kwargs.items():
-            setattr(self, k, v)
+        super(XDCCStopableReactor, self).__init__(*args, **kwargs)
+        self.stopped = Event()
 
-    def __repr__(self):
-        string = [
-            "<",
-            self.__class__.__name__,
-        ]
-        for k in self.__slots__:
-            string.append(" ")
-            string.append(k)
-            string.append("=")
-            string.append(repr(getattr(self, k)))
+    def process_forever(self, timeout=0.2):
+        while not self.stopped.is_set():
+            self.process_once(timeout=timeout)
 
-        string.append(">")
-        return "".join(string)
+    def stop(self):
+        self.stopped.set()
 
 
 class XDCCDownloadClient(irc.client.SimpleIRCClient):
+    reactor_class = XDCCStopableReactor
+
     def __init__(self, target, cmd, file, options):
         super(XDCCDownloadClient, self).__init__()
         self.target = target
@@ -85,18 +78,22 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self.dcc = None
         self._exited = False
         self.received_bytes = 0
+        self.size = -1
 
         self._bar_received_bytes = 0
         self._timeout_received_bytes = 0
 
         self.original_filename = ""
 
+        self._last_str = ""
         self.warning = ""
         self._short_warning = True
         self._refresh_timeout = False
 
+        self.success = None
+
     def on_nicknameinuse(self, conn, evt):
-        self._termmsg("Nickname already in use.")
+        self._write_message("Nickname already in use.")
         conn.nick(conn.get_nickname() + "_")
 
     def on_ctcp(self, conn, evt):
@@ -112,7 +109,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self.connection.quit()
 
     def on_welcome(self, conn, evt):
-        self._termmsg("Waiting for connection.")
+        self._write_status("Waiting for connection.")
         if not self.options.channel:
             self._initiate()
         else:
@@ -122,16 +119,23 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self._initiate()
 
     def _initiate(self):
-        self.connection.privmsg(self.target, self.cmd)
+        if self.dcc is not None:
+            return
+
+        self._privmsg(self.target, self.cmd)
         self._request_time = time.time()
         t = Thread(target=self._await_timeout)
         t.setDaemon(True)
         t.start()
+    def _privmsg(self, target, txt):
+        if self.options.verbose == 1:
+            self._write_message(target, "<", txt)
+        self.connection.privmsg(self.target, self.cmd)
 
     def _await_timeout(self):
         time.sleep(self.options.timeout)
         if self.dcc is None:
-            self.connection.quit()
+            self._disconnect()
             return
 
         while self.dcc is not None:
@@ -150,13 +154,18 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
             # Yeah, we failed. Stop the client.
             if self.received_bytes == self._timeout_received_bytes:
-                self.connection.quit()
-                self._termmsg("\nDownload timed out.")
+                self._disconnect()
+                self._write_status("Download timed out.")
                 return
 
     def _termmsg(self, *args, **kwargs):
         import sys
         print(*args, file=sys.stderr, **kwargs)
+    def _write_message(self, *args, **kwargs):
+        _lmsg = self._last_str
+        self._write_status("")
+        self._termmsg(*args, **kwargs)
+        self._write_status(_lmsg)
 
     def check_source(self, source, target=False):
         if target:
@@ -174,6 +183,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
                     return True
             return False
         return True
+
     def do_dcc(self, conn, evt):
         if not self.check_source(evt.source):
             self._termmsg("Unknown DCC Source: " + str(evt))
@@ -188,7 +198,6 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
         self.original_filename = fn
 
-        import os.path
         self.stream = self._get_stream_of_file(os.path.basename(fn))
         addr, port = irc.client.ip_numstr_to_quad(addr), int(port)
         self.dcc = self.dcc_connect(addr, port, "raw")
@@ -197,8 +206,20 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         _thread.setDaemon(True)
         _thread.start()
 
+    def _write_status(self, string):
+        # Make sure the status line fits the screen.
+        term_size = shutil.get_terminal_size((80,20))
+        self._last_str = self._last_str[:term_size.columns]
+
+        self._termmsg("\r" + (" "*len(self._last_str)), end="")
+
+        if len(string) > term_size.columns:
+            string = string[:term_size.columns-3] + "..."
+
+        self._termmsg("\r" + string, end="")
+        self._last_str = string
+
     def _dlnotice(self):
-        self._last_str = ""
         while self.dcc is not None:
             pos = self.received_bytes/self.size
             pos = int(30*pos)
@@ -214,10 +235,6 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
             # Make sure the status line fits the screen.
             term_size = shutil.get_terminal_size((80,20))
-            self._last_str = self._last_str[:term_size.columns]
-
-            # Clear the status line.
-            self._termmsg("\r" + (" "*len(self._last_str)), end="")
 
             if term_size.columns > 100:
                 # Calcculate speed meter.
@@ -230,16 +247,12 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
                 speed = ""
 
             # Generate the new one.
-            self._last_str = "".join(("\r%8s/%8s"%(
+            string = "".join(("\r%8s/%8s"%(
                 humansize(self.received_bytes),
                 humansize(self.size)
             ),  speed, " [", posstr,  "] ", extra, " "))
 
-            # Concatenate the terminal size.
-            if term_size.columns < len(self._last_str):
-                self._last_str = self._last_str[:term_size.columns-3]+"..."
-
-            self._termmsg(self._last_str, end="")
+            self._write_status(string)
             time.sleep(1)
 
     def on_dccmsg(self, conn, evt):
@@ -273,77 +286,208 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             self.on_dcc_disconnect(conn, evt)
 
     def on_dcc_disconnect(self, conn, evt):
-        self.stream.close()
-        self.connection.quit()
-        self.dcc.disconnect()
-        self.dcc = None
+        if self.dcc is not None:
+            self.stream.close()
+            self._disconnect()
+            self.dcc.disconnect()
+            self.dcc = None
+
         if not self._exited:
             if self.received_bytes == self.size:
-                self._termmsg("\nDownload complete.")
+                self._write_status("Download complete")
+            elif not self.original_filename:
+                self._write_status(
+                    "Failed to download: " + self.original_filename
+                )
             else:
-                self._termmsg()
+                self._write_status(
+                    "Failed to establish DCC connection."
+                )
+            self._termmsg()
             self._exited = True
 
     def on_disconnect(self, conn, evt):
-        import sys
-        sys.exit(0 if self.received_bytes == self.size else 1)
-
+        self.on_dcc_disconnect(conn, evt)
+        self.success = self.received_bytes == self.size
+        self._termmsg()
+        self.stop()
+    def stop(self):
+        self.reactor.stop()
     def _get_stream_of_file(self, orig):
         if self.file == "-":
             import sys
             return sys.stdout.buffer
-        elif self.file:
+        elif not os.path.isdir(self.file):
             return open(self.file, "wb")
         else:
-            self._termmsg("Downloading into:", orig)
-            return open(orig, "wb")
+            path = os.path.join(self.file, orig)
+            return open(path, "wb")
 
     def on_privmsg(self, conn, evt):
         if self.check_source(evt.source, target=True):
-            self._termmsg(">", *evt.arguments)
+            self._write_message(evt.source.nick, ">", *evt.arguments)
     on_privnotice = on_privmsg
+    def _disconnect(self):
+        if not self._exited:
+            self.connection.quit()
 
 
 def main():
-    args = docopt.docopt(__doc__)
-    target = args.get("<target>", "")
-    if target is not None:
-        target = target.split(":")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "server",
+        help="The server address."
+    )
+    parser.add_argument(
+        "bot",
+        help="The name of the xdcc bot."
+    )
 
-    if target is None or len(target)>2:
-        print("Invalid target.")
-        return -1
-    elif len(target)==2:
-        target, port = target[0], int(target[1])
+    parser.add_argument(
+        "id",
+        help="The id of the pack."
+    )
+
+    parser.add_argument(
+        "-o", "--output",
+        required=False,
+        default=".",
+        action="store",
+        help="The desired filename (or - for stdout)"
+    )
+
+    parser.add_argument(
+        "-b", "--batch",
+        action="store_true",
+        help="Batch download a file."
+    )
+
+    parser.add_argument(
+        "-n", "--nick",
+        required=False,
+        default=getpass.getuser(),
+        action="store",
+        help="The desired nickname. [Default: The current username.]"
+    )
+
+    parser.add_argument(
+       "-c", "--channel",
+        required=False,
+        default=None,
+        action="store",
+        help="The channel that should be joined."
+    )
+
+    parser.add_argument(
+        "--id-prefix",
+        required=False,
+        default="#",
+        action="store",
+        help="The prefix for the id."
+    )
+
+    parser.add_argument(
+        "--verb",
+        required=False,
+        default="XDCC SEND",
+        action="store",
+        help="The command that should be sent. [Default: XDCC SEND]"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="count",
+        help="The verbosity of the output."
+    )
+
+    parser.add_argument(
+        "--user-agent",
+        required=False,
+        default="TERM-XDCC/0.0.1 IRC/12",
+        action="store",
+        help="The verion string that is queried by some servers.",
+        dest="user_agent"
+    )
+
+    parser.add_argument(
+        "-t", "--timeout",
+        required=False,
+        default=30,
+        type=int,
+        action="store",
+        help="The timeout time."
+    )
+
+    parser.add_argument(
+        "--force-response",
+        action="store_true",
+        default=False,
+        help="Enforce DCC-Packet response. (Dangerous)",
+        dest="force_response"
+    )
+
+    parser.add_argument(
+        "-s", "--sender",
+        action="append",
+        help="Who is allowed to send the DCC response?"
+    )
+
+    args = parser.parse_args()
+
+    server = args.server.split(":", 2)
+    if len(server)==2:
+        addr, port = server[0], int(server[1])
     else:
-        (target,), port = target, 6667
+        (addr,), port = server, 6667
 
-    if args["-"]:
-        args["--file"] = "-"
+    if not args.sender:
+        args.sender = ["target"]
+    args.sender = ",".join(args.sender)
 
-    nick = args["--nick"]
-    if nick is None:
-        nick = getpass.getuser()
+    try:
+        if not args.batch:
+            return int(not download(addr, port, args.nick, args, args.id))
+        else:
+            return int(not batch(addr, port, args.nick, args))
+    except KeyboardInterrupt:
+        return -1
 
-    options = OptionContainer(
-        sender = args["--sender"],
-        channel = args["--channel"],
-        timeout = int(args["--timeout"]),
-        user_agent = args["--user-agent"],
-        force_response = args["--force-response"]
-    )
+def batch(addr, port, nick, args):
+    if not os.path.isdir(args.output):
+        import sys
+        print("Batch output not a directory.")
+        return False
 
+    id_iterator_list = []
+    for r in args.id.split(","):
+        if "-" in r:
+            start, stop = r.split("-")
+            id_iterator_list.append(range(int(start), int(stop)+1))
+        else:
+            id_iterator_list.append((int(r),))
+
+    for iter in id_iterator_list:
+        for id in iter:
+            if not download(addr, port, nick, args, str(id)):
+                return False
+    return True
+
+
+def download(addr, port, nick, args, id):
     cl = XDCCDownloadClient(
-        args["<bot>"],
-        args["--verb"] + " " + args["--id-prefix"] + args["<id>"],
-        args["--file"],
-        options
+        args.bot,
+        args.verb + " " + args.id_prefix + id,
+        args.output,
+        args
     )
-    cl.connect(target, port, nick)
+    cl.connect(addr, port, nick)
     try:
         cl.start()
     except KeyboardInterrupt:
-        cl.on_dcc_disconnect(None, None)
+        cl._disconnect()
+        raise
+
+    return cl.success
+
 
 if __name__ == "__main__":
     import sys
