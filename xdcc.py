@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 """
 XDCC Downloader
-
-Usage:
-  xdcc.py [-h | --help]
-  xdcc.py (<target> <bot> <id>) [ -f FILE | - ] [-n NICK] [options]
-
-Options:
-  --file FILE, -f FILE     The desired filename
-  --nick NICK, -n NICK     The desired nickname
-  --sender S               Who can send the dcc request. [Default: target]
-                           Choices: [target, <name>, all]
-  --channel C, -c C        The channel the bot should join before requesting
-                           the pack.
-  --timeout T, -t T        How long should we wait. (in s) [Default: 30]
-  --verb V                 The command sent to the bot [Default: XDCC SEND]
-  --id-prefix I            The prefix for the ID. [Default: #]
-  --user-agent UA          [Default: XDCC.PY/0.0.1 (PYTHON-IRCLIB/12)]
-  --force-response         Should the bot force the DCC-Response packets to
-                           be sent?
 """
 import time
 import math
@@ -30,7 +12,7 @@ import os.path
 import argparse
 from shlex import split
 from subprocess import list2cmdline
-from threading import Thread, Event
+from threading import Thread, Event, Timer
 
 import irc.client
 
@@ -91,6 +73,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self._refresh_timeout = False
 
         self.success = None
+        self._client_state = None
 
     def on_nicknameinuse(self, conn, evt):
         self._write_message("Nickname already in use.")
@@ -105,18 +88,60 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         elif cmd == "DCC":
             self.do_dcc(conn, evt)
         else:
-            self._termmsg(conn, evt.source, evt.arguments)
-            self.connection.quit()
+            self._write_message(conn, evt.source, evt.arguments)
+
+    def run(self):
+        # List of channels we already joined.
+        channels = set()
+
+        # Send a nice status message when we are sending messages.
+        if self.options.message:
+            self._write_status("Sending out messages")
+
+        # Handle our pre-request messages first.
+        for target, message in self.options.message:
+            # Handle channels differently
+            if irc.client.is_channel(target):
+                # Make sure we join the channel.
+                if target not in channels:
+                    self.connection.join(target)
+                    yield
+                    channels.channel(target)
+
+            # Write a message
+            self._privmsg(target, message)
+
+        # Join the channel required for the bot to work.
+        if self.options.channel and self.options.channel not in channels:
+            self.connection.join(self.options.channel)
+            yield
+            channels.add(self.options.channel)
+
+        # Send a nice status.
+        self._write_status("Waiting for connection.")
+
+        # When we did everything initiate the xdcc request.
+        self._initiate()
+
+    def start_client_state(self):
+        if self._client_state is not None:
+            raise RuntimeError("There is already a request running.")
+        self._client_state = self.run()
+        self.advance_client_state()
+
+    def advance_client_state(self):
+        if self._client_state is None:
+            raise RuntimeError("The bot has no state.")
+        next(self._client_state, None)
 
     def on_welcome(self, conn, evt):
-        self._write_status("Waiting for connection.")
-        if not self.options.channel:
-            self._initiate()
-        else:
-            self.connection.join(self.options.channel)
+        self.start_client_state()
 
     def on_join(self, conn, evt):
-        self._initiate()
+        if evt.source.nick != conn.get_nickname():
+            return
+
+        self.advance_client_state()
 
     def _initiate(self):
         if self.dcc is not None:
@@ -161,6 +186,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
     def _termmsg(self, *args, **kwargs):
         import sys
         print(*args, file=sys.stderr, **kwargs)
+
     def _write_message(self, *args, **kwargs):
         _lmsg = self._last_str
         self._write_status("")
@@ -168,6 +194,9 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         self._write_status(_lmsg)
 
     def check_source(self, source, target=False):
+        if not source:
+            return "server" in self.options.sender
+
         if target:
             if source.nick == self.target:
                 return True
@@ -186,14 +215,14 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
 
     def do_dcc(self, conn, evt):
         if not self.check_source(evt.source):
-            self._termmsg("Unknown DCC Source: " + str(evt))
+            self._write_message("Unknown DCC Source: " + str(evt))
             return
 
         payload = evt.arguments[1]
         cmd, fn, addr, port, sz = split(payload)
         if cmd != "SEND":
-            self._termmsg("Unexpected DCC Command:", cmd)
-            self.connection.quit()
+            self._write_message("Unexpected DCC Command:", cmd)
+            self._disconnect()
             return
 
         self.original_filename = fn
@@ -256,6 +285,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
             time.sleep(1)
 
     def on_dccmsg(self, conn, evt):
+        # Just read the data as normal.
         data = evt.arguments[0]
         self.stream.write(data)
         self.stream.flush()
@@ -264,9 +294,8 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         # Make sure we can write to the socket without blocking.
         # Otherwise just silently drop the received_bytes notice.
         r,w,x = select.select([], [self.dcc.socket], [], 0)
-        if self.options.force_response or (self.dcc.socket in w):
-
-            blocks =  self.options.force_response and self.dcc.socket not in w
+        blocks = self.dcc.socket not in w
+        if self.options.force_response or not blocks:
 
             # Send a warning message so the users get a warning if it
             # starts to block.
@@ -275,15 +304,22 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
                 self._refresh_timeout = True               # Expect timeout
                 self.warning = "Download my be stuck."
 
+            # Send the response packet.
             self.dcc.send_bytes(struct.pack("!I", self.received_bytes))
 
+            # Disable the warning once we were able to send the response,
             if blocks:
                 self._short_warning = True
                 self.warning = ""
 
         # Some peers do not drop connection after we received the file.
         if self.received_bytes == self.size:
-            self.on_dcc_disconnect(conn, evt)
+            # We will wait a second or two before dropping the connection
+            # on our side. This will allow the other side to drop the
+            # connection
+            def _drop_connection():
+                self.on_dcc_disconnect(conn, evt)
+            Timer(5, _drop_connection).start()
 
     def on_dcc_disconnect(self, conn, evt):
         if self.dcc is not None:
@@ -295,7 +331,7 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         if not self._exited:
             if self.received_bytes == self.size:
                 self._write_status("Download complete")
-            elif not self.original_filename:
+            elif self.original_filename:
                 self._write_status(
                     "Failed to download: " + self.original_filename
                 )
@@ -309,10 +345,11 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
     def on_disconnect(self, conn, evt):
         self.on_dcc_disconnect(conn, evt)
         self.success = self.received_bytes == self.size
-        self._termmsg()
         self.stop()
+
     def stop(self):
         self.reactor.stop()
+
     def _get_stream_of_file(self, orig):
         if self.file == "-":
             import sys
@@ -327,9 +364,10 @@ class XDCCDownloadClient(irc.client.SimpleIRCClient):
         if self.check_source(evt.source, target=True):
             self._write_message(evt.source.nick, ">", *evt.arguments)
     on_privnotice = on_privmsg
+
     def _disconnect(self):
         if not self._exited:
-            self.connection.quit()
+            self.connection.quit(self.options.disconnect_message)
 
 
 def main():
@@ -429,6 +467,23 @@ def main():
         "-s", "--sender",
         action="append",
         help="Who is allowed to send the DCC response?"
+             "[target, all, server, <name>]"
+    )
+
+    parser.add_argument(
+        "--disconnect-message",
+        action="store",
+        default="Just downloading a file.",
+        dest="disconnect_message"
+    )
+
+    parser.add_argument(
+        "--message",
+        nargs=2,
+        metavar=("TARGET", "MESSAGE"),
+        action="append",
+        help="Messages that should be sent beforehand.",
+        default=[]
     )
 
     args = parser.parse_args()
@@ -450,6 +505,7 @@ def main():
             return int(not batch(addr, port, args.nick, args))
     except KeyboardInterrupt:
         return -1
+
 
 def batch(addr, port, nick, args):
     if not os.path.isdir(args.output):
